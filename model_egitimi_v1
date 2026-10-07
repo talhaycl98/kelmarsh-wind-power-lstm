@@ -1,0 +1,151 @@
+import pandas as pd
+import numpy as np
+from io import StringIO
+from sklearn.preprocessing import MinMaxScaler
+
+# --- ADIM 1: VERİYİ YÜKLEME ---
+# Greenbyte dosyalarında yorum satırları '#' ile başlar.
+# Bu satırlar temizlenmeden pandas, başlık satırını göremez.
+dosya_yolu = "Turbine_Data_Kelmarsh_1_2021-01-01_-_2022-01-01_228.csv"
+
+with open(dosya_yolu, encoding='utf-8') as f:
+    lines = [line.rstrip('\n') for line in f]
+
+header_line = next(line for line in lines if line.lstrip().startswith('# Date and time'))
+clean_lines = [header_line.lstrip('#').strip()] + [
+    line.strip() for line in lines if line.strip() and not line.lstrip().startswith('#')
+]
+
+df = pd.read_csv(StringIO('\n'.join(clean_lines)), parse_dates=['Date and time'])
+
+# Tarihi indeks yapıp kronolojik olarak sıralıyoruz
+df.set_index('Date and time', inplace=True)
+df.sort_index(inplace=True)
+
+# --- ADIM 2: ÖZNİTELİK SEÇİMİ VE TEMİZLİK ---
+# Modelin girdileri (Girdi: Rüzgar hızı ve yönü, Hedef: Güç)
+features = ['Wind speed (m/s)', 'Wind direction (°)', 'Power (kW)']
+data = df[features].copy()
+
+# Eksik (NaN) değerleri temizleme
+data.dropna(inplace=True)
+
+# Türbinin kapalı/arıza anlarındaki negatif güç okumalarını filtreleme
+data = data[data['Power (kW)'] >= 0]
+
+print("Temizlenen verinin satır ve sütun sayısı:", data.shape)
+
+# --- ADIM 3: VERİYİ ÖLÇEKLENDİRME (SCALING) ---
+# Değerleri 0 ile 1 arasına normalize ediyoruz
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_data = scaler.fit_transform(data)
+
+# --- ADIM 4: KAYAN PENCERE (SLIDING WINDOW) ---
+# Geçmiş 24 adıma (4 saat) bakıp bir sonraki adımı tahmin edecek yapı
+def create_dataset(dataset, time_steps=24):
+    X, y = [], []
+    for i in range(len(dataset) - time_steps):
+        X.append(dataset[i:(i + time_steps), :])
+        y.append(dataset[i + time_steps, 2])  # 2. indeks: Power (kW)
+    return np.array(X), np.array(y)
+
+time_steps = 24
+X, y = create_dataset(scaled_data, time_steps)
+
+# --- ADIM 5: EĞİTİM VE TEST SETİNE AYIRMA ---
+# Kronolojik olarak ilk %80 eğitim, son %20 test
+train_size = int(len(X) * 0.8)
+X_train, X_test = X[:train_size], X[train_size:]
+y_train, y_test = y[:train_size], y[train_size:]
+
+print("Eğitim seti X boyutu:", X_train.shape)
+print("Eğitim seti y boyutu:", y_train.shape)
+print("Test seti X boyutu:", X_test.shape)
+
+# ==========================================
+# ADIM 6: MODEL MİMARİSİNİ OLUŞTURMA (LSTM)
+# ==========================================
+from keras.models import Sequential
+from keras.layers import LSTM, Dense, Dropout
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+model = Sequential([
+    # 1. Katman: 64 hücreli LSTM. 
+    # return_sequences=True, çünkü hemen arkasından bir LSTM katmanı daha gelecek.
+    LSTM(64, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+    
+    # Ezberlemeyi (overfitting) önlemek için nöronların %20'sini rastgele devre dışı bırakıyoruz.
+    Dropout(0.2),
+    
+    # 2. Katman: 32 hücreli LSTM. 
+    # return_sequences=False, çünkü bu katmandan sonra klasik Dense katmanına geçiyoruz.
+    LSTM(32, return_sequences=False),
+    Dropout(0.2),
+    
+    # 3. Katman: Özellikleri birleştiren 16 nöronluk tam bağlı katman (Dense)
+    Dense(16, activation='relu'),
+    
+    # Çıktı Katmanı: Tahmin edilecek tek bir değer (Gelecekteki Güç Değeri)
+    Dense(1)
+])
+
+# Modeli derleme: Hata fonksiyonu olarak MSE (Ortalama Kare Hata), optimizasyon için Adam kullanıyoruz.
+model.compile(optimizer='adam', loss='mse')
+model.summary()
+
+# ==========================================
+# ADIM 7: MODELİ EĞİTME
+# ==========================================
+print("\nModel eğitimi başlıyor...")
+# epochs=15: Model tüm veri setini 15 tur inceleyecek (süreyi makul tutmak için 15 idealdir).
+# batch_size=64: Her seferinde 64 örnek üzerinden ağırlıklar güncellenir.
+# shuffle=False: Zaman serisinin akışını bozmamak için veriler karıştırılmaz.
+history = model.fit(
+    X_train, y_train,
+    epochs=15,
+    batch_size=64,
+    validation_split=0.1,  # Eğitim verisinin %10'u doğrulama (val_loss) için kullanılır
+    shuffle=False
+)
+
+# ==========================================
+# ADIM 8: TAHMİN VE GERÇEK BİRİME DÖNÜŞTÜRME
+# ==========================================
+print("\nTest seti üzerinde tahminler yapılıyor...")
+# Modelin ürettiği tahminler (0-1 arasında ölçeklenmiş halde)
+y_pred_scaled = model.predict(X_test)
+
+# Ölçekleyiciyi (scaler) 3 sütunla (Hız, Yön, Güç) fit ettiğimiz için,
+# tersine çevirirken (inverse_transform) aynı şekli oluşturup sadece güç sütununu dolduruyoruz.
+dummy_pred = np.zeros((len(y_pred_scaled), 3))
+dummy_pred[:, 2] = y_pred_scaled[:, 0]
+y_pred_actual = scaler.inverse_transform(dummy_pred)[:, 2]
+
+dummy_test = np.zeros((len(y_test), 3))
+dummy_test[:, 2] = y_test
+y_true_actual = scaler.inverse_transform(dummy_test)[:, 2]
+
+# ==========================================
+# ADIM 9: PERFORMANS METRİKLERİ
+# ==========================================
+rmse = np.sqrt(mean_squared_error(y_true_actual, y_pred_actual))
+mae = mean_absolute_error(y_true_actual, y_pred_actual)
+
+print(f"\n--- Model Test Performansı ---")
+print(f"MAE  (Ortalama Mutlak Hata): {mae:.2f} kW")
+print(f"RMSE (Kök Ortalama Kare Hata): {rmse:.2f} kW")
+
+# ==========================================
+# ADIM 10: GÖRSELLEŞTİRME
+# ==========================================
+# Test setinin ilk 300 adımını (yaklaşık 2 günlük süre) çizdiriyoruz:
+plt.figure(figsize=(14, 6))
+plt.plot(y_true_actual[:300], label='Gerçek Güç (kW)', color='blue')
+plt.plot(y_pred_actual[:300], label='LSTM Tahmini (kW)', color='red', linestyle='--')
+plt.title('Kelmarsh Türbin 1 - Güç Tahmini Karşılaştırması (İlk 300 Adım)')
+plt.xlabel('Zaman Adımı (10 Dakikalık Aralıklar)')
+plt.ylabel('Güç (kW)')
+plt.legend()
+plt.grid(True)
+plt.show()

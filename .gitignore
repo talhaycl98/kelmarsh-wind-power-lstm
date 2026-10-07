@@ -1,0 +1,7 @@
+@"
+*.csv
+*.zip
+*.kmz
+.ipynb_checkpoints/
+__pycache__/
+"@ | Out-File -Encoding utf8 .gitignore
